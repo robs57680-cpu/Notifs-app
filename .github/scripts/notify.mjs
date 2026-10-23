@@ -1,4 +1,4 @@
-/* Envoie les notifications push de Box Score (nouvelle séance, message du coach, réaction reçue, et, pour le coach, nouvelle inscription).
+/* Envoie les notifications push de Box Score (nouvelle séance, message du coach, réaction reçue, résumé de la semaine, et, pour le coach, nouvelle inscription).
    Lancé toutes les 15 minutes par .github/workflows/notify.yml. L'état (dernier passage, notifications déjà envoyées)
    est gardé dans Firestore : config/pushState. */
 import admin from 'firebase-admin';
@@ -70,10 +70,28 @@ try {
 } catch (e) {
   console.error('Liste des comptes impossible (droits du compte de service ?) : ' + (e.message || e));
 }
-console.log(`Nouvelles séances : ${newWods.length} · nouveau message du coach : ${newAnn.length} · nouvelles réactions : ${newRx.length} · nouvelles séances validées : ${newSess.length} · nouveaux comptes : ${newUsers.length}`);
+/* résumé de la semaine : le lundi de 5 h à 12 h (heure de Paris), une seule fois par lundi (clé « m:AAAA-MM-JJ » = ce lundi),
+   seulement si la semaine écoulée (lundi → dimanche) avait au moins une séance. Passé 12 h, on ne l'envoie plus (la bannière du Fil prend le relais dans l'appli). */
+const RECAP_FROM_H = 5, RECAP_UNTIL_H = 12;
+const addDays = (ymd, n) => { const [y, m, d] = ymd.split('-').map(Number); return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10); };
+const newRecap = [];
+try {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Paris', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23', weekday: 'short' })
+    .formatToParts(now).map(x => [x.type, x.value]));
+  const hour = Number(p.hour), monday = `${p.year}-${p.month}-${p.day}`, key = 'm:' + monday;
+  if (p.weekday === 'Mon' && hour >= RECAP_FROM_H && hour < RECAP_UNTIL_H && !done.has(key)) {
+    const FP = admin.firestore.FieldPath;
+    const prev = await db.collection('wods').where(FP.documentId(), '>=', addDays(monday, -7)).where(FP.documentId(), '<=', addDays(monday, -1)).limit(1).get();
+    if (!prev.empty) newRecap.push({ key, monday });
+    else console.log('Résumé de la semaine : aucune séance la semaine passée, pas de notification.');
+  }
+} catch (e) {
+  console.error('Résumé de la semaine impossible : ' + (e.message || e));
+}
+console.log(`Nouvelles séances : ${newWods.length} · nouveau message du coach : ${newAnn.length} · nouvelles réactions : ${newRx.length} · nouvelles séances validées : ${newSess.length} · nouveaux comptes : ${newUsers.length} · résumé de la semaine : ${newRecap.length}`);
 
-const saveState = () => stRef.set({ lastRun: now.toISOString(), sent: [...sent, ...newWods.map(x => x.key), ...newAnn.map(x => x.key), ...newRx.map(x => x.key), ...newSess.map(x => x.key), ...newUsers.map(x => x.key)].slice(-KEEP) });
-if (!newWods.length && !newAnn.length && !newRx.length && !newSess.length && !newUsers.length) { await saveState(); process.exit(0); }
+const saveState = () => stRef.set({ lastRun: now.toISOString(), sent: [...sent, ...newWods.map(x => x.key), ...newAnn.map(x => x.key), ...newRx.map(x => x.key), ...newSess.map(x => x.key), ...newUsers.map(x => x.key), ...newRecap.map(x => x.key)].slice(-KEEP) });
+if (!newWods.length && !newAnn.length && !newRx.length && !newSess.length && !newUsers.length && !newRecap.length) { await saveState(); process.exit(0); }
 
 const subs = (await db.collection('pushSubs').get()).docs.map(d => ({ ...d.data(), id: d.id }));
 const coach = await db.doc('config/coach').get();
@@ -91,6 +109,10 @@ if (newWods.length) {
 if (newAnn.length) {
   const a = newAnn[0];
   for (const uid of new Set(subs.map(s => s.uid))) if (uid !== coachUid) add(uid, { tag: 'ann', title: cut(a.title, 60) || 'Message du coach', body: cut(a.text, 140), go: 'feed' });
+}
+/* résumé de la semaine : à tous les athlètes abonnés sauf le coach ; s'ouvre sur l'écran du résumé (?go=recap) */
+if (newRecap.length) {
+  for (const uid of new Set(subs.map(s => s.uid))) if (uid !== coachUid) add(uid, { tag: 'recap', title: 'Ta semaine', body: 'Ton résumé de la semaine est prêt : découvre comment le classement a bougé.', go: 'recap' });
 }
 if (newRx.length) {
   const wods = Object.fromEntries((await db.collection('wods').get()).docs.map(d => [d.id, d.data()]));
@@ -139,6 +161,10 @@ for (const s of subs) {
       if (e.statusCode === 404 || e.statusCode === 410) { await db.doc('pushSubs/' + s.id).delete(); gone++; break; } /* appareil désinscrit */
       fail++; console.error('Échec d’envoi (' + (e.statusCode || '?') + ') : ' + (e.body || e.message));
     }
+  }
+}
+console.log(`Envoyées : ${ok} · appareils retirés : ${gone} · échecs : ${fail}`);
+await saveState();
   }
 }
 console.log(`Envoyées : ${ok} · appareils retirés : ${gone} · échecs : ${fail}`);
