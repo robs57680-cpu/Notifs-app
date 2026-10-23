@@ -165,7 +165,3 @@ for (const s of subs) {
 }
 console.log(`Envoyées : ${ok} · appareils retirés : ${gone} · échecs : ${fail}`);
 await saveState();
-  }
-}
-console.log(`Envoyées : ${ok} · appareils retirés : ${gone} · échecs : ${fail}`);
-await saveState();
