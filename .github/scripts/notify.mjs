@@ -1,6 +1,8 @@
-/* Envoie les notifications push de Box Score (nouvelle séance, message du coach, réaction reçue, résumé de la semaine, et, pour le coach, nouvelle inscription).
+/* Envoie les notifications push de Box Score (nouvelle séance, message du coach, réaction reçue, séance validée par un autre athlète,
+   résumé de la semaine — à tous les abonnés, coach compris — et, pour le coach seulement, nouvelle inscription).
    Lancé toutes les 15 minutes par .github/workflows/notify.yml. L'état (dernier passage, notifications déjà envoyées)
-   est gardé dans Firestore : config/pushState. */
+   est gardé dans Firestore : config/pushState. Il est enregistré AVANT l'envoi : en cas de plantage pendant l'envoi, mieux vaut une notification
+   manquée que des doublons à chaque passage suivant. (Ce fichier remplace notify-weekly-recap.mjs : ne pas l'importer en plus.) */
 import admin from 'firebase-admin';
 import webpush from 'web-push';
 
@@ -110,9 +112,13 @@ if (newAnn.length) {
   const a = newAnn[0];
   for (const uid of new Set(subs.map(s => s.uid))) if (uid !== coachUid) add(uid, { tag: 'ann', title: cut(a.title, 60) || 'Message du coach', body: cut(a.text, 140), go: 'feed' });
 }
-/* résumé de la semaine : à tous les athlètes abonnés sauf le coach ; s'ouvre sur l'écran du résumé (?go=recap) */
+/* résumé de la semaine : à tous les appareils abonnés, coach compris (texte à part pour lui) ; s'ouvre sur l'écran du résumé (?go=recap) */
 if (newRecap.length) {
-  for (const uid of new Set(subs.map(s => s.uid))) if (uid !== coachUid) add(uid, { tag: 'recap', title: 'Ta semaine', body: 'Ton résumé de la semaine est prêt : découvre comment le classement a bougé.', go: 'recap' });
+  for (const uid of new Set(subs.map(s => s.uid))) {
+    add(uid, uid === coachUid
+      ? { tag: 'recap', title: 'Résumé de la semaine', body: 'Le résumé de la semaine est prêt : découvre comment le classement a bougé.', go: 'recap' }
+      : { tag: 'recap', title: 'Ta semaine', body: 'Ton résumé de la semaine est prêt : découvre comment le classement a bougé.', go: 'recap' });
+  }
 }
 if (newRx.length) {
   const wods = Object.fromEntries((await db.collection('wods').get()).docs.map(d => [d.id, d.data()]));
@@ -150,6 +156,9 @@ if (joined.length && coachUid) {
   add(coachUid, { tag: 'signup', title: joined.length === 1 ? 'Nouvel inscrit' : 'Nouveaux inscrits', body, go: 'feed' });
 }
 
+/* état enregistré avant l'envoi (voir l'entête) */
+await saveState();
+
 let ok = 0, gone = 0, fail = 0;
 for (const s of subs) {
   for (const m of msgs[s.uid] || []) {
@@ -158,10 +167,9 @@ for (const s of subs) {
         JSON.stringify({ title: 'Box Score', ...m }), { TTL: 86400, urgency: 'normal' });
       ok++;
     } catch (e) {
-      if (e.statusCode === 404 || e.statusCode === 410) { await db.doc('pushSubs/' + s.id).delete(); gone++; break; } /* appareil désinscrit */
+      if (e.statusCode === 404 || e.statusCode === 410) { try { await db.doc('pushSubs/' + s.id).delete(); } catch (_) {} gone++; break; } /* abonnement expiré ou désinscrit (seuls ces deux codes) */
       fail++; console.error('Échec d’envoi (' + (e.statusCode || '?') + ') : ' + (e.body || e.message));
     }
   }
 }
 console.log(`Envoyées : ${ok} · appareils retirés : ${gone} · échecs : ${fail}`);
-await saveState();
