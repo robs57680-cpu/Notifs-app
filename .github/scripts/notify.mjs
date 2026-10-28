@@ -1,5 +1,5 @@
 /* Envoie les notifications push de Box Score (nouvelle séance, message du coach, réaction reçue, séance validée par un autre athlète,
-   résumé de la semaine — à tous les abonnés, coach compris — et, pour le coach seulement, nouvelle inscription).
+   résumé de la semaine — à tous les abonnés, coach compris — et, pour le coach seulement, nouvelle inscription et nouvel abonnement payant/essai).
    Lancé toutes les 15 minutes par .github/workflows/notify.yml. L'état (dernier passage, notifications déjà envoyées)
    est gardé dans Firestore : config/pushState. Il est enregistré AVANT l'envoi : en cas de plantage pendant l'envoi, mieux vaut une notification
    manquée que des doublons à chaque passage suivant. (Ce fichier remplace notify-weekly-recap.mjs : ne pas l'importer en plus.) */
@@ -23,15 +23,16 @@ if (!st.exists) {
   console.log('Première exécution : état initialisé, aucune notification envoyée.');
   process.exit(0);
 }
-const { lastRun, sent = [] } = st.data();
+const { lastRun, sent = [], seenSubs } = st.data();
 const since = new Date(new Date(lastRun).getTime() - OVERLAP_MS).toISOString();
 const done = new Set(sent);
 
-const [wSnap, rSnap, aSnap, lSnap] = await Promise.all([
+const [wSnap, rSnap, aSnap, lSnap, subSnap] = await Promise.all([
   db.collection('wods').where('publishedAt', '>', since).get(),
   db.collection('reactions').where('at', '>', since).get(),
   db.doc('config/announcement').get(),
-  db.collection('logs').get()
+  db.collection('logs').get(),
+  db.collection('subs').get()
 ]);
 const newWods = wSnap.docs.map(d => ({ ...d.data(), id: d.id, key: 'w:' + d.id + ':' + d.data().publishedAt })).filter(x => !done.has(x.key));
 const newRx = rSnap.docs.map(d => ({ ...d.data(), id: d.id, key: 'r:' + d.id + ':' + d.data().at })).filter(x => !done.has(x.key) && x.to && x.from !== x.to);
@@ -72,6 +73,15 @@ try {
 } catch (e) {
   console.error('Liste des comptes impossible (droits du compte de service ?) : ' + (e.message || e));
 }
+/* nouveaux abonnements : documents subs/{uid} (écrits par la synchro Stripe) dont l'abonnement est en essai ou actif et dont le uid n'a jamais été notifié.
+   La liste des uid déjà vus est gardée à part (seenSubs), sans la limite KEEP. Au tout premier passage avec cette fonction (seenSubs absent),
+   les abonnements déjà présents sont marqués comme vus sans notification. */
+const subOk = d => d.active === true || d.status === 'trialing' || d.status === 'active';
+const currentSubs = subSnap.docs.filter(d => subOk(d.data())).map(d => ({ uid: d.id, plan: d.data().plan, status: d.data().status }));
+const firstSubRun = !Array.isArray(seenSubs);
+const seenSet = new Set(firstSubRun ? [] : seenSubs);
+const newSubs = firstSubRun ? [] : currentSubs.filter(x => !seenSet.has(x.uid));
+const seenSubsNext = [...new Set([...(firstSubRun ? [] : seenSubs), ...currentSubs.map(x => x.uid)])].slice(-5000);
 /* résumé de la semaine : le lundi de 5 h à 12 h (heure de Paris), une seule fois par lundi (clé « m:AAAA-MM-JJ » = ce lundi),
    seulement si la semaine écoulée (lundi → dimanche) avait au moins une séance. Passé 12 h, on ne l'envoie plus (la bannière du Fil prend le relais dans l'appli). */
 const RECAP_FROM_H = 5, RECAP_UNTIL_H = 12;
@@ -90,10 +100,10 @@ try {
 } catch (e) {
   console.error('Résumé de la semaine impossible : ' + (e.message || e));
 }
-console.log(`Nouvelles séances : ${newWods.length} · nouveau message du coach : ${newAnn.length} · nouvelles réactions : ${newRx.length} · nouvelles séances validées : ${newSess.length} · nouveaux comptes : ${newUsers.length} · résumé de la semaine : ${newRecap.length}`);
+console.log(`Nouvelles séances : ${newWods.length} · nouveau message du coach : ${newAnn.length} · nouvelles réactions : ${newRx.length} · nouvelles séances validées : ${newSess.length} · nouveaux comptes : ${newUsers.length} · résumé de la semaine : ${newRecap.length} · nouveaux abonnements : ${newSubs.length}`);
 
-const saveState = () => stRef.set({ lastRun: now.toISOString(), sent: [...sent, ...newWods.map(x => x.key), ...newAnn.map(x => x.key), ...newRx.map(x => x.key), ...newSess.map(x => x.key), ...newUsers.map(x => x.key), ...newRecap.map(x => x.key)].slice(-KEEP) });
-if (!newWods.length && !newAnn.length && !newRx.length && !newSess.length && !newUsers.length && !newRecap.length) { await saveState(); process.exit(0); }
+const saveState = () => stRef.set({ lastRun: now.toISOString(), sent: [...sent, ...newWods.map(x => x.key), ...newAnn.map(x => x.key), ...newRx.map(x => x.key), ...newSess.map(x => x.key), ...newUsers.map(x => x.key), ...newRecap.map(x => x.key)].slice(-KEEP), seenSubs: seenSubsNext });
+if (!newWods.length && !newAnn.length && !newRx.length && !newSess.length && !newUsers.length && !newRecap.length && !newSubs.length) { await saveState(); process.exit(0); }
 
 const subs = (await db.collection('pushSubs').get()).docs.map(d => ({ ...d.data(), id: d.id }));
 const coach = await db.doc('config/coach').get();
@@ -154,6 +164,17 @@ if (joined.length && coachUid) {
     ? (names[0] ? `${names[0]} vient de s'inscrire.` : 'Un nouvel athlète vient de s\'inscrire.')
     : `${joined.length} nouveaux inscrits${names.length ? ' : ' + names.slice(0, 3).join(', ') + (names.length > 3 ? '…' : '') : ''}.`;
   add(coachUid, { tag: 'signup', title: joined.length === 1 ? 'Nouvel inscrit' : 'Nouveaux inscrits', body, go: 'feed' });
+}
+
+/* nouvel abonnement : notification pour le coach uniquement (pas pour son propre compte) */
+const subscribed = newSubs.filter(x => x.uid !== coachUid);
+if (subscribed.length && coachUid) {
+  const planName = p => p === 'season' ? 'forfait saison' : p === '4w' ? 'forfait 4 semaines' : '';
+  const nm = x => cut(pseudoOf[x.uid] || 'Un athlète', 24);
+  const body = subscribed.length === 1
+    ? `${nm(subscribed[0])} s'est abonné${planName(subscribed[0].plan) ? ' (' + planName(subscribed[0].plan) + ')' : ''}${subscribed[0].status === 'trialing' ? ', essai gratuit en cours' : ''}.`
+    : `${subscribed.length} nouveaux abonnements : ${[...new Set(subscribed.map(nm))].slice(0, 3).join(', ')}${subscribed.length > 3 ? '…' : ''}.`;
+  add(coachUid, { tag: 'subscription', title: subscribed.length === 1 ? 'Nouvel abonnement' : 'Nouveaux abonnements', body, go: 'feed' });
 }
 
 /* état enregistré avant l'envoi (voir l'entête) */
